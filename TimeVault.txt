@@ -1,0 +1,680 @@
+// ==UserScript==
+// @name         Autotask Time Entry Stash & Restore
+// @namespace    trantech
+// @version      3.0
+// @description  Stash + delete a ticket's time entries, change company, restore them. Multi-user aware, validated, with backups.
+// @match        https://*.autotask.net/Mvc/ServiceDesk/TicketDetail.mvc*
+// @match        https://*.autotask.net/Mvc/ServiceDesk/TimeEntry.mvc*
+// @require      https://cdn.jsdelivr.net/npm/sweetalert2@11.14.5/dist/sweetalert2.all.min.js
+// @run-at       document-idle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_listValues
+// @grant        unsafeWindow
+// ==/UserScript==
+
+/* global Swal */
+(() => {
+  'use strict';
+
+  /* ======================= STORAGE (double-written) ======================= */
+  // Every write goes to BOTH Tampermonkey storage and the site's localStorage,
+  // so clearing browser/site data alone can't wipe a stash.
+  const hasGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+  const S = {
+    get(k, d) {
+      let v;
+      if (hasGM) { try { v = GM_getValue(k); } catch (_) {} }
+      if (v === undefined || v === null) {
+        try { const r = localStorage.getItem(k); if (r) v = JSON.parse(r); } catch (_) {}
+      }
+      return v === undefined || v === null ? d : v;
+    },
+    set(k, v) {
+      if (hasGM) { try { GM_setValue(k, v); } catch (_) {} }
+      try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch (_) {}
+    },
+    keys(prefix) {
+      const out = new Set();
+      if (typeof GM_listValues === 'function') { try { GM_listValues().forEach(k => k.startsWith(prefix) && out.add(k)); } catch (_) {} }
+      try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith(prefix)) out.add(k); } } catch (_) {}
+      return [...out];
+    }
+  };
+  const STASH = id => 'ats2:stash:' + id;
+  const ARCHIVE = 'ats2:archive';
+  const JOB = 'ats2:job';
+  const LOG = 'ats2:log';
+  const ME = 'ats2:me';
+  const RESTORE_WINDOW = 'atsRestoreWindow';
+
+  /* ======================= HELPERS ======================= */
+  const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const waitFor = async (fn, t = 8000, step = 200) => {
+    const s = Date.now();
+    while (Date.now() - s < t) { try { const r = fn(); if (r) return r; } catch (_) {} await sleep(step); }
+    return null;
+  };
+  const press = el => {
+    if (!el) return false;
+    const o = { bubbles: true, cancelable: true, view: W };
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.dispatchEvent(new MouseEvent('click', o));
+    return true;
+  };
+  const setVal = (el, v) => {
+    if (!el) return false;
+    const set = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
+    el.focus();
+    set ? set.call(el, v) : (el.value = v);
+    ['input', 'change', 'keyup', 'blur'].forEach(e => el.dispatchEvent(new Event(e, { bubbles: true })));
+    return el.value === v;
+  };
+  const fieldAfter = (root, label) => [...root.querySelectorAll('.EditorLabelContainer1 .PrimaryText')]
+    .find(x => x.textContent.trim() === label)?.closest('.EditorLabelContainer1')?.nextElementSibling || null;
+  const findBtn = (root, text) => [...root.querySelectorAll('.Button2 .Text2')]
+    .find(t => t.textContent.trim() === text)?.closest('.Button2') || null;
+  const rich = el => {
+    if (!el) return { text: '', html: '' };
+    const c = el.cloneNode(true);
+    c.querySelectorAll('br').forEach(b => b.replaceWith('\n'));
+    c.querySelectorAll('div,p,li').forEach(d => d.append('\n'));
+    return { html: el.innerHTML.trim(), text: c.textContent.replace(/\n{3,}/g, '\n\n').trim() };
+  };
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const download = (name, obj) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' }));
+    a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 3000);
+  };
+  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+  /* ---------- normalised identity of a time entry ---------- */
+  // Dates/times are reduced to numbers so "09:00 AM" vs "9:00 AM" can't break matching.
+  const normDate = d => (d || '').split('/').map(x => String(parseInt(x, 10))).join('/');
+  const toMin = t => {
+    const m = (t || '').match(/(\d{1,2}):(\d{2})\s*([AP])M/i);
+    if (!m) return null;
+    return (+m[1] % 12 + (m[3].toUpperCase() === 'P' ? 12 : 0)) * 60 + +m[2];
+  };
+  // "Smith, John" and "John Smith" produce the same key
+  const nameKey = n => (n || '').toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean).sort().join(' ');
+  const tKey = (d, s, e) => `${normDate(d)}|${toMin(s)}|${toMin(e)}`;
+  const eKey = (d, s, e, who) => `${tKey(d, s, e)}|${nameKey(who)}`;
+  const entryKey = e => e.feedKey || eKey(e.date, e.start, e.end, e.author);
+  const entryTKey = e => tKey(e.date, e.start, e.end);
+  const minutes = e => { const a = toMin(e.start), b = toMin(e.end); return a == null || b == null ? 0 : (b - a + 1440) % 1440; };
+  const hrs = m => (m / 60).toFixed(2);
+  const sameUser = (a, b) => !!a && !!b && nameKey(a) === nameKey(b);
+
+  // Read a time entry form (works on a live page OR a fetched/parsed document)
+  const readForm = root => {
+    const f = l => fieldAfter(root, l);
+    const inp = l => (f(l)?.querySelector('input')?.value || f(l)?.querySelector('input')?.getAttribute('value') || '').trim();
+    const sel = l => f(l)?.querySelector('.TargetPreview')?.textContent.trim() || '';
+    const n = rich(f('Summary Notes')?.querySelector('.ContentEditable2'));
+    const i = rich(f('Internal Notes')?.querySelector('.ContentEditable2'));
+    return {
+      date: inp('Date'), start: inp('Start Time'), end: inp('End Time'),
+      notes: n.text, notesHtml: n.html, internal: i.text, internalHtml: i.html,
+      resource: sel('Resource'), role: sel('Role'),
+      workType: f('Work Type')?.querySelector('.Chip .Text')?.textContent.trim() || ''
+    };
+  };
+
+  /* ---------- audit log + archive ---------- */
+  const logEvent = (ev, detail, ticket) => {
+    const l = S.get(LOG, []);
+    l.push({ t: new Date().toISOString(), by: S.get(ME, '?'), ticket: ticket || '', ev, detail: detail || '' });
+    while (l.length > 1000) l.shift();
+    S.set(LOG, l);
+  };
+  const archivePush = (snap, reason) => {
+    if (!snap) return;
+    const a = S.get(ARCHIVE, []);
+    a.push({ ...snap, archivedAt: new Date().toISOString(), reason });
+    while (a.length > 500) a.shift();
+    S.set(ARCHIVE, a);
+  };
+
+  /* ---------- UI helpers (SweetAlert2) ---------- */
+  if (!document.getElementById('ats-swal-css')) {
+    const st = document.createElement('style');
+    st.id = 'ats-swal-css';
+    st.textContent = `
+      .ats-t{width:100%;border-collapse:collapse;font-size:12.5px;text-align:left}
+      .ats-t th{background:#f3f4f6;padding:5px 8px;position:sticky;top:0}
+      .ats-t td{padding:4px 8px;border-top:1px solid #e5e7eb;vertical-align:top}
+      .ats-t tr.other td{background:#fef3c7}
+      .ats-wrap{max-height:260px;overflow:auto;border:1px solid #e5e7eb;border-radius:6px;margin:10px 0}
+      .ats-chk{list-style:none;margin:8px 0;padding:0;text-align:left;font-size:13.5px}
+      .ats-chk li{padding:3px 0}
+      .ats-prog .ats-bar{height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden}
+      .ats-prog .ats-bar i{display:block;height:100%;width:0;background:#2563eb;transition:width .2s}
+      .ats-prog .ats-msg{margin-top:10px;font-size:13px;color:#4b5563}
+      .ats-menu{display:flex;flex-direction:column;gap:8px}
+      .ats-menu button{padding:9px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer;font-size:14px}
+      .ats-menu button:hover{background:#f3f4f6}
+      .swal2-container{z-index:2147483100!important}`;
+    document.head.appendChild(st);
+  }
+  const Toast = Swal.mixin({ toast: true, position: 'bottom-end', showConfirmButton: false, timer: 4500, timerProgressBar: true });
+  const say = (msg, icon = 'info') => { console.log('[stash]', msg); Toast.fire({ icon, title: msg }); };
+  const fail = (title, text) => Swal.fire({ icon: 'error', title, html: esc(text).replace(/\n/g, '<br>') });
+  const ask = async o => (await Swal.fire({ showCancelButton: true, reverseButtons: true, ...o })).isConfirmed;
+  const progress = title => {
+    Swal.fire({ title, html: '<div class="ats-prog"><div class="ats-bar"><i></i></div><div class="ats-msg"></div></div>', allowOutsideClick: false, allowEscapeKey: false, showConfirmButton: false });
+    return (pct, msg) => {
+      const c = Swal.getHtmlContainer(); if (!c) return;
+      const i = c.querySelector('.ats-bar i'), m = c.querySelector('.ats-msg');
+      if (i) i.style.width = pct + '%';
+      if (m) m.textContent = msg;
+    };
+  };
+  const menuDialog = async (title, items) => {
+    let picked = null;
+    await Swal.fire({
+      title, showConfirmButton: false, showCloseButton: true,
+      html: `<div class="ats-menu">${items.map((it, i) => `<button data-i="${i}">${esc(it.label)}</button>`).join('')}</div>`,
+      didOpen: el => el.querySelectorAll('.ats-menu button').forEach(b => b.onclick = () => { picked = items[+b.dataset.i]; Swal.close(); })
+    });
+    return picked;
+  };
+
+  /* ---------- who am I? (basis for all multi-user checks) ---------- */
+  async function getMe(force) {
+    let me = S.get(ME, '');
+    if (!me || force) {
+      const r = await Swal.fire({
+        title: 'Who are you?',
+        text: 'Enter your name as it appears on your time entries. Used to flag other people\'s time.',
+        input: 'text', inputValue: me, showCancelButton: true,
+        inputValidator: v => !v.trim() && 'Required'
+      });
+      if (!r.isConfirmed) return null;
+      me = r.value.trim(); S.set(ME, me);
+    }
+    return me;
+  }
+
+  // Best-effort: the company currently on the ticket (used to catch "forgot to change it")
+  const readCompany = () => {
+    for (const l of ['Account', 'Company', 'Customer', 'Organization']) {
+      const f = fieldAfter(document, l);
+      const v = (f?.querySelector('input')?.value || f?.querySelector('.TargetPreview')?.textContent || f?.textContent || '').trim();
+      if (v) return v;
+    }
+    return '';
+  };
+
+  /* ======================= ROUTER ======================= */
+  if (/\/TimeEntry\.mvc/i.test(location.pathname)) { restoreWindowMain(); return; }
+  if (!/\/TicketDetail\.mvc/i.test(location.pathname)) return;
+
+  /* ======================= TICKET PAGE (main or popout) ======================= */
+  const ticketId = new URLSearchParams(location.search).get('ticketId');
+  if (!ticketId) return;
+  const ticketNumber = (document.title.match(/T\d{8}\.\d{4}/) || [])[0] || ('ticket-' + ticketId);
+
+  const parseFeed = () => [...document.querySelectorAll('.ConversationItem')]
+    .filter(el => el.querySelector(':scope > .Details > .Header .InlineIcon.Clock'))
+    .map(el => {
+      const url = el.querySelector(':scope > .Details .ContextOverlayActionButton[data-url*="timeEntryId"]')?.dataset.url;
+      const id = url ? new URL(url, location.origin).searchParams.get('timeEntryId') : null;
+      const title = el.querySelector(':scope > .Details > .Title')?.textContent.trim() || '';
+      const m = title.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(\d{1,2}:\d{2}\s*[AP]M)/i);
+      const msg = el.querySelector(':scope > .Details > .Message .Searchable');
+      const del = [...el.querySelectorAll(':scope > .Details > .Footer .FooterActions .LinkButton2')]
+        .find(b => b.textContent.trim().toLowerCase() === 'delete');
+      const author = el.querySelector(':scope > .Details .Author')?.textContent.trim() || '';
+      return {
+        el, id, title, del, author,
+        date: m?.[1] || '', start: m?.[2] || '', end: m?.[3] || '',
+        key: m ? eKey(m[1], m[2], m[3], author) : null,
+        tkey: m ? tKey(m[1], m[2], m[3]) : null,
+        notes: msg ? rich(msg).text : ''
+      };
+    });
+
+  // Which stash entries are back on the ticket - and under the RIGHT user?
+  const verify = (st, feed) => {
+    const pool = {};
+    feed.forEach(f => { if (f.key) (pool[f.key] ||= []).push(f); });
+    const restored = [], pending = [];
+    (st?.entries || []).forEach(e => { const p = pool[entryKey(e)]; if (p?.length) { p.shift(); restored.push(e); } else pending.push(e); });
+    // Pending entries whose time slot exists on the ticket under a DIFFERENT user = wrong resource
+    const left = Object.values(pool).flat();
+    const wrong = [], missing = [];
+    pending.forEach(e => {
+      const i = left.findIndex(f => f.tkey === entryTKey(e));
+      if (i >= 0) { wrong.push({ entry: e, feed: left[i] }); left.splice(i, 1); } else missing.push(e);
+    });
+    return { restored, pending, wrong, missing };
+  };
+
+  /* ---------- UI: Shadow-DOM pill (immune to Autotask CSS) ---------- */
+  document.getElementById('ats-stash-panel')?.remove();
+  clearInterval(W.__atsStashTimer);
+  const host = document.createElement('div');
+  host.id = 'ats-stash-panel';
+  host.style.cssText = 'position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:2147483000';
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = `
+    <style>
+      .bar{display:flex;align-items:center;gap:8px;background:#111827;color:#fff;font:13px Segoe UI,Arial,sans-serif;padding:8px 12px;border-radius:999px;box-shadow:0 6px 20px rgba(0,0,0,.45);max-width:95vw}
+      .info{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      button{border:0;border-radius:999px;padding:6px 13px;color:#fff;cursor:pointer;font:inherit;font-weight:600}
+      button:hover{filter:brightness(1.15)}
+      .danger{background:#dc2626}.ok{background:#16a34a}.grey{background:#4b5563}.blue{background:#2563eb}.icon{background:transparent;font-size:16px;padding:4px 8px}
+      [hidden]{display:none}
+    </style>
+    <div class="bar">
+      <span class="info" id="info"></span>
+      <button class="danger" id="bStash">Stash &amp; delete all</button>
+      <button class="ok" id="bRestore"></button>
+      <button class="grey" id="bArchive"></button>
+      <button class="icon" id="bMenu" title="Backups &amp; settings">⋯</button>
+    </div>`;
+  document.body.appendChild(host);
+  const $ = id => root.getElementById(id);
+  const info = $('info'), bStash = $('bStash'), bRestore = $('bRestore'), bArchive = $('bArchive'), bMenu = $('bMenu');
+
+  let busy = false;
+  const render = () => {
+    const feed = parseFeed();
+    const st = S.get(STASH(ticketId));
+    const v = verify(st, feed);
+    const users = new Set(feed.map(f => nameKey(f.author))).size;
+    let t = `⏱ ${feed.length} ${feed.length === 1 ? 'entry' : 'entries'}${users > 1 ? ` · 👥 ${users} users` : ''}`;
+    if (st) {
+      t += ` · 📦 ${st.entries.length} stashed (${v.restored.length} back, ${v.pending.length} pending`;
+      if (v.wrong.length) t += `, ⚠ ${v.wrong.length} wrong user`;
+      t += ')';
+    }
+    info.textContent = t;
+    bStash.hidden = busy || !feed.length || !!(st && v.pending.length);
+    bRestore.hidden = busy || !(st && v.pending.length);
+    bRestore.textContent = `↩ Restore ${v.pending.length}`;
+    bArchive.hidden = busy || !st;
+    const done = st && !v.pending.length;
+    bArchive.className = done ? 'ok' : 'grey';
+    bArchive.textContent = done ? '✔ All back – archive' : 'Archive stash';
+  };
+  W.__atsStashTimer = setInterval(() => { if (!busy) render(); }, 2000);
+
+  /* ---------- PREFLIGHT VALIDATION ---------- */
+  const entriesTable = (entries, me) => `<div class="ats-wrap"><table class="ats-t"><tr><th>Date</th><th>Time</th><th>User</th><th>Hrs</th><th>Notes</th></tr>${
+    entries.map(e => `<tr class="${sameUser(e.author, me) ? '' : 'other'}"><td>${esc(e.date)}</td><td>${esc(e.start)}–${esc(e.end)}</td><td>${esc(e.author)}</td><td>${hrs(minutes(e))}</td><td>${esc((e.notes || '').slice(0, 70))}</td></tr>`).join('')
+  }</table></div>`;
+
+  function preflight(entries, feed, me) {
+    const blockers = [], warns = [], oks = [];
+    const noDelete = feed.filter(f => !f.del);
+    const unreadable = feed.filter(f => !f.key);
+    const partial = entries.filter(e => e.source !== 'full');
+    const others = entries.filter(e => !sameUser(e.author, me));
+    const dupes = Object.entries(entries.reduce((a, e) => (a[entryKey(e)] = (a[entryKey(e)] || 0) + 1, a), {})).filter(([, n]) => n > 1);
+    const mism = entries.filter(e => e.mismatch);
+
+    if (unreadable.length) blockers.push(`${unreadable.length} entr${unreadable.length > 1 ? 'ies have' : 'y has'} an unreadable date/time`);
+    if (noDelete.length) blockers.push(`${noDelete.length} entr${noDelete.length > 1 ? 'ies cannot' : 'y cannot'} be deleted (posted / approved / locked / no permission): ${noDelete.map(f => esc(f.title)).join('; ')}`);
+    if (others.length) warns.push(`<b>${others.length}</b> entr${others.length > 1 ? 'ies belong' : 'y belongs'} to <b>other users</b>: ${[...new Set(others.map(e => esc(e.author)))].join(', ')}. Restoring needs permission to log time for them; entries that can't be restored under the right user will NOT be auto-saved.`);
+    if (partial.length) warns.push(`${partial.length} entr${partial.length > 1 ? 'ies' : 'y'} only had basic details (role / work type will use defaults on restore)`);
+    if (mism.length) warns.push(`${mism.length} entr${mism.length > 1 ? 'ies' : 'y'} show different times in the feed vs. the edit form`);
+    if (dupes.length) warns.push(`${dupes.length} identical duplicate entr${dupes.length > 1 ? 'ies' : 'y'} (same user, date and time)`);
+    if (!blockers.length) oks.push('All entries read and can be deleted');
+    if (!others.length) oks.push('Only your own time on this ticket');
+    return { blockers, warns, oks, others };
+  }
+
+  /* ---------- STASH + DELETE ---------- */
+  async function fetchEntry(id) {
+    const urls = [
+      `/Mvc/ServiceDesk/TimeEntry.mvc/EditTicketTimeEntryPage?timeEntryId=${id}`,
+      `/Mvc/ServiceDesk/TimeEntry.mvc/EditTicketTimeEntryDialog?timeEntryId=${id}`
+    ];
+    for (const u of urls) {
+      try {
+        const r = await fetch(u, { credentials: 'include' });
+        if (!r.ok) continue;
+        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+        const d = readForm(doc);
+        if (d.date && d.start && d.end) return d;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  async function stashAll() {
+    if (busy) return;
+    const me = await getMe(); if (!me) return;
+    const feed = parseFeed();
+    if (!feed.length) return say('No time entries on this ticket.');
+    const existing = S.get(STASH(ticketId));
+    if (existing) {
+      const v = verify(existing, feed);
+      if (v.pending.length) return fail('Existing stash not restored', `A stash with ${v.pending.length} unrestored entries already exists for ${ticketNumber}. Restore it first.`);
+    }
+
+    busy = true; render();
+    try {
+      // 1. Capture (read-only, nothing touched yet)
+      const upd = progress('Reading time entries…');
+      const entries = [];
+      for (let i = 0; i < feed.length; i++) {
+        const f = feed[i];
+        upd(Math.round(i / feed.length * 100), `Entry ${i + 1} of ${feed.length}`);
+        const full = f.id ? await fetchEntry(f.id) : null;
+        const e = {
+          uid: `${f.id || 'x'}-${i}-${Date.now()}`,
+          timeEntryId: f.id, author: f.author, feedKey: f.key,
+          date: full?.date || f.date, start: full?.start || f.start, end: full?.end || f.end,
+          notes: full?.notes || f.notes, notesHtml: full?.notesHtml || '',
+          internal: full?.internal || '', internalHtml: full?.internalHtml || '',
+          resource: full?.resource || f.author, role: full?.role || '', workType: full?.workType || '',
+          source: full ? 'full' : 'feed-only', feedTitle: f.title,
+          mismatch: !!full && f.tkey !== tKey(full.date, full.start, full.end)
+        };
+        if (!e.date || !e.start || !e.end) { Swal.close(); throw new Error(`Couldn't read date/time for entry ${i + 1} ("${f.title}"). Nothing deleted.`); }
+        entries.push(e);
+      }
+      Swal.close();
+
+      // 2. Validate + review
+      const pf = preflight(entries, feed, me);
+      const totalM = entries.reduce((a, e) => a + minutes(e), 0);
+      const list = (arr, ic) => arr.map(x => `<li>${ic} ${x}</li>`).join('');
+      const summary = `<ul class="ats-chk">${list(pf.blockers, '❌')}${list(pf.warns, '⚠️')}${list(pf.oks, '✅')}</ul>`;
+      if (pf.blockers.length) {
+        await Swal.fire({ icon: 'error', title: 'Cannot stash this ticket', width: '55rem', html: summary + entriesTable(entries, me), confirmButtonText: 'Close' });
+        return;
+      }
+      const needTyped = pf.others.length > 0;
+      const ok = await Swal.fire({
+        icon: needTyped ? 'warning' : 'question', width: '55rem',
+        title: `Stash ${entries.length} entr${entries.length > 1 ? 'ies' : 'y'} (${hrs(totalM)} hrs)?`,
+        html: summary + entriesTable(entries, me) + (needTyped ? `<p style="font-size:13px">Other users' time is included. Type <b>${esc(ticketNumber)}</b> to confirm:</p>` : ''),
+        input: needTyped ? 'text' : undefined,
+        inputPlaceholder: ticketNumber,
+        inputValidator: needTyped ? v => v.trim().toUpperCase() !== ticketNumber.toUpperCase() && `Type ${ticketNumber} to continue` : undefined,
+        showCancelButton: true, reverseButtons: true, confirmButtonText: 'Backup & continue'
+      });
+      if (!ok.isConfirmed) return;
+
+      // 3. Save + verify + backup BEFORE touching anything
+      if (existing) archivePush(existing, 'replaced by new stash');
+      const snap = {
+        version: 3, ticketId, ticketNumber, url: location.href, company: readCompany(),
+        createdBy: me, createdAt: new Date().toISOString(), entries
+      };
+      S.set(STASH(ticketId), snap);
+      archivePush(snap, 'created');
+      const check = S.get(STASH(ticketId));
+      if (!check || check.entries?.length !== entries.length) throw new Error('Stash failed to save. Nothing deleted.');
+      download(`autotask-time-backup_${ticketNumber}_${stamp()}.json`, snap);
+      logEvent('stash', `${entries.length} entries, ${hrs(totalM)}h, users: ${[...new Set(entries.map(e => e.author))].join(', ')}`, ticketNumber);
+
+      if (!(await ask({ icon: 'success', title: 'Stashed & backup downloaded', text: `Delete the ${entries.length} entries from the ticket now?`, confirmButtonText: 'Delete from ticket', confirmButtonColor: '#dc2626' }))) {
+        return say('Stashed + backed up. Nothing deleted.', 'success');
+      }
+
+      // 4. Delete one at a time, verifying each
+      const known = new Set(entries.map(e => e.timeEntryId).filter(Boolean));
+      const del = progress('Deleting entries…');
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        del(Math.round(i / entries.length * 100), `Deleting ${i + 1} of ${entries.length}`);
+        const cur = parseFeed();
+        // Someone added time while we were working? Abort rather than delete the unknown.
+        const stranger = cur.find(x => x.id && !known.has(x.id));
+        if (stranger) throw new Error(`New time entry appeared on the ticket (${stranger.author}: ${stranger.title}) after the stash was taken.\nDeletion stopped - the stash is safe. Re-stash to include it.`);
+        const target = (e.timeEntryId && cur.find(x => x.id === e.timeEntryId)) || cur.find(x => x.key === entryKey(e));
+        if (!target) continue; // already gone
+        if (!target.del) throw new Error(`No delete link on "${target.title}" (posted/locked?). Delete the rest manually - stash is safe.`);
+        const before = cur.filter(x => x.key === target.key).length;
+        press(target.del);
+        const yes = await waitFor(() => { const y = document.getElementById('ConfirmationDialogYesButton'); return y && y.offsetParent ? y : null; }, 5000);
+        if (yes) press(yes);
+        const gone = await waitFor(() => {
+          const now = parseFeed();
+          return e.timeEntryId ? !now.some(x => x.id === e.timeEntryId) : now.filter(x => x.key === target.key).length < before;
+        }, 12000);
+        if (!gone) throw new Error(`"${target.title}" didn't delete. Delete remaining entries manually - stash is safe.`);
+        await sleep(400);
+      }
+      Swal.close();
+      logEvent('delete', `${entries.length} entries deleted`, ticketNumber);
+      await Swal.fire({ icon: 'success', title: 'Done', text: `${entries.length} entries deleted & stashed. Change the company, then click Restore.` });
+    } catch (err) { Swal.close(); fail('Stash stopped', err.message); logEvent('error', err.message, ticketNumber); console.error(err); }
+    finally { busy = false; render(); }
+  }
+
+  /* ---------- RESTORE (runs in a separate window - works from popouts too) ---------- */
+  const jobActive = j => j && Date.now() - (j.heartbeat || j.startedAt) < 30000;
+
+  async function restoreAll() {
+    if (busy) return;
+    const me = await getMe(); if (!me) return;
+    const st = S.get(STASH(ticketId));
+    const v = verify(st, parseFeed());
+    if (!v.pending.length) return say('Nothing to restore - all entries are on the ticket.', 'success');
+
+    // --- validation gates ---
+    const job0 = S.get(JOB);
+    if (jobActive(job0)) return fail('A restore is already running', `A restore for ticket ${job0.ticketNumber || job0.ticketId} (started by ${job0.by || 'someone'}) is still active. Wait for it to finish.`);
+    const now = readCompany();
+    if (st.company && now && nameKey(st.company) === nameKey(now)) {
+      if (!(await ask({ icon: 'warning', title: 'Company looks unchanged', html: `The ticket is still on <b>${esc(now)}</b> - the same company it had when stashed.<br>Did you change it?`, confirmButtonText: 'Yes, restore anyway' }))) return;
+    }
+    if (st.createdBy && !sameUser(st.createdBy, me)) {
+      if (!(await ask({ icon: 'warning', title: 'Stash created by someone else', html: `This stash was created by <b>${esc(st.createdBy)}</b>, you are <b>${esc(me)}</b>. Continue?`, confirmButtonText: 'Continue' }))) return;
+    }
+    const mine = v.pending.filter(e => sameUser(e.author, me));
+    const others = v.pending.filter(e => !sameUser(e.author, me));
+    let scope = 'all';
+    const body = `${v.wrong.length ? `<p style="color:#b91c1c">⚠ ${v.wrong.length} entr${v.wrong.length > 1 ? 'ies are' : 'y is'} on the ticket under the <b>wrong user</b> (see ⋯ menu). They are not counted as restored.</p>` : ''}${entriesTable(v.pending, me)}`;
+    if (others.length) {
+      const r = await Swal.fire({
+        title: 'Restore which entries?', width: '55rem', html: body, icon: 'question',
+        input: 'radio', inputValue: mine.length ? 'mine' : 'all',
+        inputOptions: { ...(mine.length ? { mine: `Only mine (${mine.length})` } : {}), all: `Everyone's (${v.pending.length}) - needs permission to log time for others` },
+        showCancelButton: true, reverseButtons: true, confirmButtonText: 'Start restore',
+        inputValidator: x => !x && 'Pick one'
+      });
+      if (!r.isConfirmed) return;
+      scope = r.value;
+    } else if (!(await ask({ title: `Restore ${v.pending.length} entr${v.pending.length > 1 ? 'ies' : 'y'} to ${ticketNumber}?`, width: '55rem', html: body + '<p style="font-size:13px">A time entry window will open and fill/save each one automatically.</p>', confirmButtonText: 'Start restore' }))) return;
+    const chosen = scope === 'mine' ? mine : v.pending;
+
+    S.set(JOB, { ticketId, ticketNumber, by: me, queue: chosen.map(e => e.uid), submitted: [], startedAt: Date.now(), heartbeat: Date.now() });
+    const w = W.open(`/Mvc/ServiceDesk/TimeEntry.mvc/NewTicketTimeEntryPage?ticketId=${ticketId}`, RESTORE_WINDOW, 'width=1050,height=900,resizable=yes,scrollbars=yes');
+    if (!w) { S.set(JOB, null); return fail('Popup blocked', 'Allow popups for autotask.net and try again.'); }
+    logEvent('restore-start', `${chosen.length} entries (${scope})`, ticketNumber);
+
+    busy = true; render();
+    Swal.fire({ title: 'Restoring…', html: 'Working in the time entry window.<br>Don\'t close it - it closes itself when finished.', allowOutsideClick: false, allowEscapeKey: false, showConfirmButton: false, didOpen: () => Swal.showLoading() });
+    const closed = await waitFor(() => w.closed, 30 * 60 * 1000, 1000);
+    const job = S.get(JOB);
+    S.set(JOB, null);
+    logEvent('restore-end', `${job?.submitted?.length || 0}/${chosen.length} submitted`, ticketNumber);
+    Swal.close();
+    say(closed ? 'Restore window closed - refreshing to verify…' : 'Timed out.', closed ? 'info' : 'warning');
+    await sleep(1200);
+    location.reload();
+  }
+
+  /* ---------- ARCHIVE / BACKUPS / MENU ---------- */
+  bArchive.onclick = async () => {
+    const st = S.get(STASH(ticketId));
+    if (!st) return;
+    const v = verify(st, parseFeed());
+    if (v.pending.length && !(await ask({ icon: 'warning', title: 'Not everything is back', text: `${v.pending.length} entries are NOT back on the ticket yet. Archive anyway? (A copy stays in Backups.)`, confirmButtonText: 'Archive anyway' }))) return;
+    archivePush(st, 'archived by user');
+    S.set(STASH(ticketId), null);
+    logEvent('archive', `${v.restored.length} restored / ${v.pending.length} pending`, ticketNumber);
+    say('Stash archived (still in Backups).', 'success'); render();
+  };
+
+  async function importBackup() {
+    const input = Object.assign(document.createElement('input'), { type: 'file', accept: '.json,application/json' });
+    input.onchange = async () => {
+      try {
+        const data = JSON.parse(await input.files[0].text());
+        let snap = null;
+        if (Array.isArray(data.entries)) snap = data;
+        else {
+          const all = [...(data.stashes || []), ...(data.archive || [])].filter(s => String(s.ticketId) === String(ticketId) && s.entries?.length);
+          all.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+          snap = all[0];
+          if (!snap) return fail('Nothing to import', 'No backup for this ticket in that file.');
+        }
+        if (!snap.entries.length || !snap.entries.every(e => e.date && e.start && e.end && toMin(e.start) != null && toMin(e.end) != null))
+          return fail('Invalid backup', 'Some entries are missing a valid date / start / end time.');
+        if (String(snap.ticketId) !== String(ticketId) &&
+            !(await ask({ icon: 'warning', title: 'Different ticket', text: `This backup is from ticket ${snap.ticketNumber || snap.ticketId}, not ${ticketNumber}. Import onto THIS ticket?`, confirmButtonText: 'Import anyway' }))) return;
+        const cur = S.get(STASH(ticketId));
+        if (cur) archivePush(cur, 'replaced by import');
+        snap.entries.forEach((e, i) => { e.uid = e.uid || `imp-${i}-${Date.now()}`; });
+        S.set(STASH(ticketId), { ...snap, ticketId, importedAt: new Date().toISOString(), importedBy: S.get(ME, '') });
+        logEvent('import', `${snap.entries.length} entries`, ticketNumber);
+        say(`Imported ${snap.entries.length} entries.`, 'success'); render();
+      } catch (e) { fail('Import failed', e.message); }
+    };
+    input.click();
+  }
+
+  async function showLog() {
+    const l = S.get(LOG, []).slice(-60).reverse();
+    await Swal.fire({
+      title: 'Audit log', width: '60rem',
+      html: `<div class="ats-wrap" style="max-height:380px"><table class="ats-t"><tr><th>When</th><th>Who</th><th>Ticket</th><th>Event</th><th>Detail</th></tr>${
+        l.map(x => `<tr><td>${esc(new Date(x.t).toLocaleString())}</td><td>${esc(x.by)}</td><td>${esc(x.ticket)}</td><td>${esc(x.ev)}</td><td>${esc(x.detail)}</td></tr>`).join('') || '<tr><td colspan="5">Empty</td></tr>'
+      }</table></div>`
+    });
+  }
+
+  async function showIssues() {
+    const st = S.get(STASH(ticketId));
+    const v = verify(st, parseFeed());
+    const rows = [...v.wrong.map(w => `<tr class="other"><td>${esc(w.entry.date)}</td><td>${esc(w.entry.start)}–${esc(w.entry.end)}</td><td>${esc(w.entry.author)}</td><td>Restored as <b>${esc(w.feed.author)}</b></td></tr>`),
+      ...v.missing.map(e => `<tr><td>${esc(e.date)}</td><td>${esc(e.start)}–${esc(e.end)}</td><td>${esc(e.author)}</td><td>Not on ticket</td></tr>`)];
+    await Swal.fire({ title: 'Restore check', width: '50rem', html: rows.length ? `<div class="ats-wrap"><table class="ats-t"><tr><th>Date</th><th>Time</th><th>Expected user</th><th>Problem</th></tr>${rows.join('')}</table></div><p style="font-size:13px">Wrong-user entries must be deleted and re-entered under the correct resource.</p>` : 'No problems found.' });
+  }
+
+  bMenu.onclick = async () => {
+    const st = S.get(STASH(ticketId));
+    const pick = await menuDialog(`Backups & settings${S.get(ME) ? ' - ' + S.get(ME) : ''}`, [
+      { label: '🔎 Check restore (wrong user / missing)', run: showIssues },
+      { label: '💾 Download this ticket\'s stash', run: () => st ? download(`autotask-time-backup_${ticketNumber}_${stamp()}.json`, st) : say('No stash for this ticket.', 'warning') },
+      { label: '📦 Download ALL backups', run: () => download(`autotask-time-ALL-backups_${stamp()}.json`, { version: 3, exportedAt: new Date().toISOString(), stashes: S.keys('ats2:stash:').map(k => S.get(k)).filter(Boolean), archive: S.get(ARCHIVE, []), log: S.get(LOG, []) }) },
+      { label: '📥 Import backup file…', run: importBackup },
+      { label: '📜 Audit log', run: showLog },
+      { label: '👤 Change my name', run: () => getMe(true) }
+    ]);
+    if (pick) await pick.run();
+  };
+
+  bStash.onclick = stashAll;
+  bRestore.onclick = restoreAll;
+  render();
+
+  /* ======================= RESTORE WINDOW (TimeEntry.mvc) ======================= */
+  async function restoreWindowMain() {
+    if (W.name !== RESTORE_WINDOW) return;                // only our window, never normal time entry popups
+    const banner = (msg, kind) => Swal.fire({
+      toast: true, position: 'top', width: '42rem', showConfirmButton: false,
+      icon: { ok: 'success', err: 'error', warn: 'warning', info: 'info' }[kind || 'info'],
+      title: '[Time Entry Restore]', html: esc(msg).replace(/\n/g, '<br>'), customClass: { popup: 'ats-toast' }
+    });
+
+    const job = S.get(JOB);
+    if (!job || Date.now() - job.startedAt > 60 * 60 * 1000) return banner('No active restore job.', 'warn');
+    setInterval(() => { const j = S.get(JOB); if (j) { j.heartbeat = Date.now(); S.set(JOB, j); } }, 5000);
+
+    const ready = await waitFor(() => fieldAfter(document, 'Date')?.querySelector('input') && findBtn(document, 'Save & New'), 25000);
+    if (!ready) return banner('Time entry form not found - restore paused. Your entries are still safely stashed.', 'err');
+
+    const titleText = (document.title + ' ' + (document.querySelector('.TitleBar1 .Title')?.textContent || ''));
+    if (/Edit Ticket Time Entry/i.test(titleText)) return banner('This is an EDIT form, not a new one - restore paused.', 'err');
+
+    const st = S.get(STASH(job.ticketId));
+    const remaining = job.queue.filter(u => !job.submitted.includes(u));
+    if (!remaining.length) {
+      S.set(JOB, null);
+      banner('All entries submitted. Closing…', 'ok');
+      await sleep(1200); W.close(); return;
+    }
+    const e = st?.entries?.find(x => x.uid === remaining[0]);
+    if (!e) return banner('Stash entry missing - restore paused. Use Backups > Import if needed.', 'err');
+    const n = job.queue.indexOf(e.uid) + 1;
+
+    // Mark submitted whenever a save button is used (auto OR manual)
+    const markSubmitted = () => {
+      const j = S.get(JOB);
+      if (j && !j.submitted.includes(e.uid)) { j.submitted.push(e.uid); S.set(JOB, j); }
+    };
+    ['Save & New', 'Save & Close'].forEach(t => {
+      const b = findBtn(document, t);
+      if (b) { b.addEventListener('mousedown', markSubmitted, true); b.addEventListener('click', markSubmitted, true); }
+    });
+
+    banner(`Filling ${n}/${job.queue.length}: ${e.date} ${e.start} - ${e.end} (${e.author})…`);
+    await sleep(800);
+
+    const f = l => fieldAfter(document, l);
+    const pick = async (container, text) => {
+      if (!text) return true;
+      if (!container) return false;
+      const cur = () => (container.querySelector('.TargetPreview')?.textContent.trim() || container.querySelector('.Chip .Text')?.textContent.trim() || '');
+      if (cur() === text) return true;
+      const find = () => [...container.querySelectorAll('.ItemList .Item')].find(i => i.textContent.trim() === text);
+      let it = find();
+      if (!it) { press(container.querySelector('.Triangle, .Button2.EditorButton2')); it = await waitFor(find, 3000); }
+      if (!it) { setVal(container.querySelector('.SearchBox input'), text); it = await waitFor(find, 4000); }
+      if (!it) return false;
+      press(it); await sleep(700);
+      return cur() === text;
+    };
+
+    const problems = [];
+    // Resource is mandatory: never fall back to the logged-in user for someone else's time
+    const resName = e.resource || e.author;
+    if (!resName || !(await pick(f('Resource'), resName))) problems.push(`Resource → ${resName || '(unknown)'}  (will NOT auto-save under the wrong user)`);
+    if (e.role && !(await pick(f('Role'), e.role))) problems.push(`Role → ${e.role}`);
+    if (e.workType && !(await pick(f('Work Type'), e.workType))) problems.push(`Work Type → ${e.workType}`);
+    await sleep(500);
+    if (!setVal(f('Date')?.querySelector('input'), e.date)) problems.push(`Date → ${e.date}`);
+    await sleep(300);
+    if (!setVal(f('Start Time')?.querySelector('input'), e.start)) problems.push(`Start → ${e.start}`);
+    await sleep(300);
+    if (!setVal(f('End Time')?.querySelector('input'), e.end)) problems.push(`End → ${e.end}`);
+    await sleep(300);
+
+    const fillRich = (label, html, text) => {
+      const ed = f(label)?.querySelector('.ContentEditable2');
+      if (!ed) return false;
+      ed.focus();
+      ed.innerHTML = html || esc(text || '').replace(/\n/g, '<br>');
+      ed.dispatchEvent(new Event('input', { bubbles: true }));
+      ed.dispatchEvent(new Event('keyup', { bubbles: true }));
+      ed.blur();
+      return rich(ed).text.length > 0 || !(text || '').length;
+    };
+    if (!fillRich('Summary Notes', e.notesHtml, e.notes)) problems.push('Summary Notes');
+    if (e.internal || e.internalHtml) fillRich('Internal Notes', e.internalHtml, e.internal);
+
+    if (problems.length) {
+      return banner(`Entry ${n}/${job.queue.length} needs a hand:\n• ${problems.join('\n• ')}\n\nFix those fields, then click "Save & New" - the script carries on with the rest.`, 'warn');
+    }
+
+    banner(`Saving ${n}/${job.queue.length}…`, 'info');
+    await sleep(800);
+    markSubmitted();
+    press(findBtn(document, 'Save & New'));
+    setTimeout(() => banner(`Entry ${n} didn't save (validation error?).\nFix the highlighted fields and click "Save & New" - the script will continue.`, 'err'), 15000);
+  }
+})();
